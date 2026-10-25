@@ -563,7 +563,7 @@ impl WindowsInputPump {
     ) -> Vec<crate::protocol::ClientInputEvent> {
         for event in &mut events {
             if let crate::raw_input::RawInputEvent::Paste(text) = event {
-                decode_windows_terminal_paste_enters(text);
+                decode_windows_terminal_paste_key_records(text);
                 self.paste_from_win32_key_records = false;
             }
         }
@@ -680,14 +680,72 @@ impl PlatformInputItem {
     }
 }
 
-fn decode_windows_terminal_paste_enters(text: &mut String) {
-    const ENTER_REPORT_PAIR: &str = "\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_";
-
-    // Windows Terminal can encode pasted newlines as an adjacent unmodified
-    // Enter press/release pair. Keep every other report-shaped payload opaque.
-    if text.contains(ENTER_REPORT_PAIR) {
-        *text = text.replace(ENTER_REPORT_PAIR, "\r");
+fn decode_windows_terminal_paste_key_records(text: &mut String) {
+    // Decode only adjacent matching key-down/up reports so partial report-shaped text stays intact.
+    let bytes = text.as_bytes();
+    if !bytes.windows(2).any(|window| window == b"\x1b[") {
+        return;
     }
+
+    let mut decoded = String::with_capacity(text.len());
+    let mut utf16 = Vec::new();
+    let mut cursor = 0;
+    let mut literal_start = 0;
+    let mut changed = false;
+
+    while cursor < bytes.len() {
+        let pair = windows_terminal_key_record_at(bytes, cursor).and_then(|(press_end, press)| {
+            windows_terminal_key_record_at(bytes, press_end).and_then(|(release_end, release)| {
+                (press.key_down
+                    && !release.key_down
+                    && press.repeat_count > 0
+                    && release.repeat_count == 1
+                    && press.virtual_key_code == release.virtual_key_code
+                    && press.virtual_scan_code == release.virtual_scan_code
+                    && press.unicode == release.unicode
+                    && press.control_key_state == release.control_key_state
+                    && press.unicode != 0)
+                    .then_some((release_end, press))
+            })
+        });
+
+        if let Some((end, press)) = pair {
+            if literal_start < cursor {
+                decoded.push_str(&String::from_utf16_lossy(&utf16));
+                utf16.clear();
+                decoded.push_str(&text[literal_start..cursor]);
+            }
+            for _ in 0..press.repeat_count {
+                utf16.push(press.unicode);
+            }
+            cursor = end;
+            literal_start = end;
+            changed = true;
+        } else {
+            cursor += 1;
+        }
+    }
+
+    if changed {
+        decoded.push_str(&String::from_utf16_lossy(&utf16));
+        decoded.push_str(&text[literal_start..]);
+        *text = decoded;
+    }
+}
+
+fn windows_terminal_key_record_at(bytes: &[u8], start: usize) -> Option<(usize, WindowsKeyRecord)> {
+    let prefix = b"\x1b[";
+    if !bytes.get(start..)?.starts_with(prefix) {
+        return None;
+    }
+    let body_start = start + prefix.len();
+    let terminator = bytes
+        .get(body_start..)?
+        .iter()
+        .position(|byte| *byte == b'_')?;
+    let end = body_start + terminator + 1;
+    let body = std::str::from_utf8(&bytes[body_start..end - 1]).ok()?;
+    Some((end, parse_win32_input_mode_key_record(body)?))
 }
 
 #[cfg(test)]
@@ -2054,6 +2112,23 @@ mod tests {
             vec![crate::protocol::ClientInputEvent::Paste {
                 text: " - line one\r  - line two\r  - line three".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn vti_remote_bracketed_paste_decodes_reported_character_records() {
+        let records = concat!(
+            "\x1b[200~",
+            "\x1b[72;35;104;1;0;1_\x1b[72;35;104;0;0;1_",
+            "\x1b[73;23;105;1;0;1_\x1b[73;23;105;0;0;1_",
+            "\x1b[201~",
+        )
+        .chars()
+        .map(key_char);
+
+        assert_eq!(
+            translate(records),
+            vec![crate::protocol::ClientInputEvent::Paste { text: "hi".into() }]
         );
     }
 
