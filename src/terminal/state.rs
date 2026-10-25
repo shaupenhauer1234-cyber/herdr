@@ -130,6 +130,7 @@ pub struct TerminalState {
     pub id: TerminalId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
+    reported_screen_detection_agent: Option<Agent>,
     pub fallback_state: AgentState,
     fallback_visible_blocker: bool,
     fallback_observed_at: Option<Instant>,
@@ -170,6 +171,7 @@ impl TerminalState {
             id,
             cwd,
             detected_agent: None,
+            reported_screen_detection_agent: None,
             fallback_state: AgentState::Unknown,
             fallback_visible_blocker: false,
             fallback_observed_at: None,
@@ -223,10 +225,57 @@ impl TerminalState {
             now,
         );
         if starts_acquisition {
+            self.reported_screen_detection_agent = None;
             self.codex_prompt_ready = false;
             self.agent_process_acquisition_pending = true;
         }
         mutation
+    }
+
+    pub fn set_reported_agent_screen_state_at(
+        &mut self,
+        agent: Option<Agent>,
+        state: AgentState,
+        visible_blocker: bool,
+        visible_working: bool,
+        now: Instant,
+    ) -> Option<TerminalStateMutation> {
+        let Some(agent) = agent else {
+            let previous_agent = self.reported_screen_detection_agent.take()?;
+            if self.detected_agent != Some(previous_agent) {
+                return None;
+            }
+            return Some(self.set_detected_state_with_screen_signals_at(
+                None,
+                AgentState::Unknown,
+                false,
+                false,
+                false,
+                false,
+                now,
+            ));
+        };
+
+        if self.full_lifecycle_hook_authority_active()
+            || self.reported_agent_screen_detection_hint() != Some(agent)
+        {
+            return None;
+        }
+        if self.detected_state_observed_before_release_suppression(Some(agent), now) {
+            return None;
+        }
+
+        let mutation = self.set_detected_state_with_screen_signals_at(
+            Some(agent),
+            state,
+            visible_blocker,
+            false,
+            visible_working,
+            false,
+            now,
+        );
+        self.reported_screen_detection_agent = Some(agent);
+        Some(mutation)
     }
 
     #[cfg(unix)]
@@ -1456,6 +1505,12 @@ impl TerminalState {
         seq: Option<u64>,
     ) -> Option<TerminalStateMutation> {
         self.set_agent_session_ref_for_session_start(source, agent_label, session_ref, seq, None)
+    }
+
+    pub fn reported_agent_screen_detection_hint(&self) -> Option<Agent> {
+        self.persisted_agent_session
+            .as_ref()
+            .and_then(|session| crate::detect::parse_agent_label(&session.agent))
     }
 
     pub fn set_agent_session_ref_for_session_start(
@@ -2769,6 +2824,92 @@ mod tests {
             );
             assert_eq!(terminal.state, AgentState::Working);
         }
+    }
+
+    #[test]
+    fn reported_session_screen_state_is_explicitly_owned_and_releasable() {
+        let mut terminal = test_terminal();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("claude-session")
+            .expect("session id should be valid");
+        terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                Some(session_ref),
+                Some(1),
+            )
+            .expect("session report should be accepted");
+
+        assert_eq!(
+            terminal.reported_agent_screen_detection_hint(),
+            Some(Agent::Claude)
+        );
+        terminal
+            .set_reported_agent_screen_state_at(
+                Some(Agent::Claude),
+                AgentState::Working,
+                false,
+                true,
+                Instant::now(),
+            )
+            .expect("matching session should accept screen state");
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Working);
+
+        terminal
+            .set_reported_agent_screen_state_at(
+                None,
+                AgentState::Unknown,
+                false,
+                false,
+                Instant::now(),
+            )
+            .expect("reported screen detection should be releasable");
+        assert_eq!(terminal.effective_agent_label(), None);
+        assert_eq!(terminal.state, AgentState::Unknown);
+        assert_eq!(
+            terminal.reported_agent_screen_detection_hint(),
+            Some(Agent::Claude)
+        );
+    }
+
+    #[test]
+    fn process_detection_takes_ownership_from_reported_session_screen_state() {
+        let mut terminal = test_terminal();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("claude-session")
+            .expect("session id should be valid");
+        terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                Some(session_ref),
+                Some(1),
+            )
+            .expect("session report should be accepted");
+        terminal.set_reported_agent_screen_state_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            false,
+            true,
+            Instant::now(),
+        );
+
+        terminal.set_detected_agent_process_at(Agent::Claude, Instant::now());
+
+        assert!(
+            terminal
+                .set_reported_agent_screen_state_at(
+                    None,
+                    AgentState::Unknown,
+                    false,
+                    false,
+                    Instant::now(),
+                )
+                .is_none(),
+            "a stale reported-screen clear must not erase process detection"
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.detected_agent, Some(Agent::Claude));
     }
 
     #[test]

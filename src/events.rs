@@ -101,6 +101,15 @@ pub enum AppEvent {
         process_exited: bool,
         observed_at: Instant,
     },
+    /// Screen state confirmed for an agent identified by a reported session.
+    ReportedSessionScreenState {
+        pane_id: PaneId,
+        agent: Option<Agent>,
+        state: AgentState,
+        visible_blocker: bool,
+        visible_working: bool,
+        observed_at: Instant,
+    },
     /// Hook-authoritative agent state was reported for a pane.
     HookStateReported {
         pane_id: PaneId,

@@ -110,6 +110,77 @@ fn codex_no_match_is_unknown_without_changing_other_agents() {
 }
 
 #[test]
+fn rule_matched_detection_requires_an_explicit_usable_state_rule() {
+    with_manifest_dirs("matched-detection", || {
+        write_local_codex(&local_manifest("working", "active-marker"));
+
+        let matched = detect_with_osc_if_rule_matches(
+            Agent::Codex,
+            DetectionInput {
+                screen: "active-marker",
+                osc_title: "",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(
+            matched.map(|detection| detection.state),
+            Some(AgentState::Working)
+        );
+
+        let unmatched = detect_with_osc_if_rule_matches(
+            Agent::Codex,
+            DetectionInput {
+                screen: "unrelated screen",
+                osc_title: "",
+                osc_progress: "",
+            },
+        );
+        assert!(unmatched.is_none());
+
+        write_local_codex(&rules_manifest(
+            r#"
+[[rules]]
+id = "viewer"
+state = "unknown"
+skip_state_update = true
+contains = ["transcript"]
+"#,
+        ));
+        let skipped = detect_with_osc_if_rule_matches(
+            Agent::Codex,
+            DetectionInput {
+                screen: "transcript",
+                osc_title: "",
+                osc_progress: "",
+            },
+        );
+        assert!(skipped.is_none());
+
+        write_local_codex(&rules_manifest(
+            r#"
+[[rules]]
+id = "osc_working"
+state = "working"
+region = "osc_title"
+regex = ['^doing work$']
+"#,
+        ));
+        let osc_matched = detect_with_osc_if_rule_matches(
+            Agent::Codex,
+            DetectionInput {
+                screen: "unrelated screen",
+                osc_title: "doing work",
+                osc_progress: "",
+            },
+        );
+        assert_eq!(
+            osc_matched.map(|detection| detection.state),
+            Some(AgentState::Working)
+        );
+    });
+}
+
+#[test]
 fn rule_semantics_apply_gates_priority_and_line_regex() {
     with_manifest_dirs("rule-semantics", || {
         write_local_codex(&rules_manifest(

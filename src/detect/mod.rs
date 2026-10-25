@@ -320,6 +320,22 @@ pub fn detect_agent_with_osc(
     )
 }
 
+pub fn detect_agent_with_osc_if_rule_matches(
+    agent: Agent,
+    screen_content: &str,
+    osc_title: &str,
+    osc_progress: &str,
+) -> Option<AgentDetection> {
+    manifest::detect_with_osc_if_rule_matches(
+        agent,
+        manifest::DetectionInput {
+            screen: screen_content,
+            osc_title,
+            osc_progress,
+        },
+    )
+}
+
 pub(crate) fn full_lifecycle_hook_authority(source: &str, agent_label: &str) -> bool {
     matches!(
         (source, agent_label),

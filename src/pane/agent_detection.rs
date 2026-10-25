@@ -81,6 +81,7 @@ impl PendingIdleConfirmation {
 pub(super) struct IdleScreenScanSkipInput {
     pub(super) state: AgentState,
     pub(super) agent: Option<Agent>,
+    pub(super) allow_unchanged_unknown_skip: bool,
     pub(super) pending_idle_active: bool,
     pub(super) agent_changed: bool,
     pub(super) process_exited: bool,
@@ -90,7 +91,8 @@ pub(super) struct IdleScreenScanSkipInput {
 
 pub(super) fn should_skip_idle_screen_scan(input: IdleScreenScanSkipInput) -> bool {
     let stable_state = input.state == AgentState::Idle
-        || (input.state == AgentState::Unknown && input.agent == Some(Agent::Codex));
+        || (input.state == AgentState::Unknown
+            && (input.agent == Some(Agent::Codex) || input.allow_unchanged_unknown_skip));
     if !stable_state
         || input.agent.is_none()
         || input.pending_idle_active
@@ -114,6 +116,7 @@ pub(super) enum DetectionScreenReadDecision {
 pub(super) struct DetectionScreenReadInput {
     pub(super) state: AgentState,
     pub(super) agent: Option<Agent>,
+    pub(super) allow_unchanged_unknown_skip: bool,
     pub(super) pending_idle_active: bool,
     pub(super) agent_changed: bool,
     pub(super) process_exited: bool,
@@ -127,6 +130,7 @@ pub(super) fn decide_detection_screen_read(
     if should_skip_idle_screen_scan(IdleScreenScanSkipInput {
         state: input.state,
         agent: input.agent,
+        allow_unchanged_unknown_skip: input.allow_unchanged_unknown_skip,
         pending_idle_active: input.pending_idle_active,
         agent_changed: input.agent_changed,
         process_exited: input.process_exited,
@@ -318,6 +322,15 @@ pub(super) fn detection_update_for_publish_with_osc(
     (!detection.skip_state_update).then_some(detection)
 }
 
+pub(super) fn detection_update_for_reported_agent_with_osc(
+    agent: Agent,
+    content: &str,
+    osc_title: &str,
+    osc_progress: &str,
+) -> Option<crate::detect::AgentDetection> {
+    crate::detect::detect_agent_with_osc_if_rule_matches(agent, content, osc_title, osc_progress)
+}
+
 pub(super) fn codex_prompt_ready(content: &str) -> bool {
     // The composer can remain visible during a turn; this is startup evidence only.
     let recent: String = content
@@ -390,6 +403,7 @@ mod tests {
         DetectionScreenReadInput {
             state,
             agent: Some(Agent::Codex),
+            allow_unchanged_unknown_skip: false,
             pending_idle_active: false,
             agent_changed: false,
             process_exited: false,
@@ -433,6 +447,23 @@ mod tests {
         );
         input.agent_changed = false;
         input.agent = Some(Agent::Pi);
+        assert_eq!(
+            decide_detection_screen_read(input),
+            DetectionScreenReadDecision::Read
+        );
+    }
+
+    #[test]
+    fn screen_read_skips_unchanged_unknown_reported_agent_candidate() {
+        let mut input = screen_read_input(AgentState::Unknown, 10);
+        input.agent = Some(Agent::Claude);
+        input.allow_unchanged_unknown_skip = true;
+        assert_eq!(
+            decide_detection_screen_read(input),
+            DetectionScreenReadDecision::Skip
+        );
+
+        input.current_detection_content_seq = Some(11);
         assert_eq!(
             decide_detection_screen_read(input),
             DetectionScreenReadDecision::Read

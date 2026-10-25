@@ -35,10 +35,10 @@ mod xtgettcap;
 
 use self::agent_detection::{
     codex_prompt_ready, decide_detection_screen_read, decide_screen_detection_publish,
-    detection_update_for_publish_with_osc, mark_detection_content_changed,
-    observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
-    DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    detection_update_for_publish_with_osc, detection_update_for_reported_agent_with_osc,
+    mark_detection_content_changed, observe_detection_content_change, DetectionPublishDecision,
+    DetectionScreenReadDecision, DetectionScreenReadInput, PendingIdleConfirmation,
+    ScreenDetectionPublishInput, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 #[cfg(unix)]
 pub use self::terminal::InputState;
@@ -268,6 +268,34 @@ async fn publish_state_changed_event(
     }
 }
 
+async fn publish_reported_session_screen_state_event(
+    state_events: &mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    agent: Option<Agent>,
+    state: AgentState,
+    visible_blocker: bool,
+    visible_working: bool,
+    observed_at: std::time::Instant,
+) {
+    if let Err(err) = state_events
+        .send(AppEvent::ReportedSessionScreenState {
+            pane_id,
+            agent,
+            state,
+            visible_blocker,
+            visible_working,
+            observed_at,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            %err,
+            "failed to deliver reported-session screen state"
+        );
+    }
+}
+
 async fn publish_agent_process_detected_event(
     state_events: mpsc::Sender<AppEvent>,
     pane_id: PaneId,
@@ -322,6 +350,7 @@ struct AgentDetectionPublishUpdate {
     visible_blocker: bool,
     visible_working: bool,
     process_exited: bool,
+    reported_session_fallback: bool,
 }
 
 async fn apply_agent_detection_publish_update(
@@ -349,17 +378,36 @@ async fn apply_agent_detection_publish_update(
     if update.process_exited {
         *foreground_shell_exit_reported = true;
     }
-    publish_state_changed_event(
-        state_events,
-        pane_id,
-        agent,
-        update.state,
-        update.visible_blocker,
-        update.visible_working,
-        update.process_exited,
-        observed_at,
-    )
-    .await;
+    if update.reported_session_fallback {
+        publish_reported_session_screen_state_event(
+            &state_events,
+            pane_id,
+            agent,
+            update.state,
+            update.visible_blocker,
+            update.visible_working,
+            observed_at,
+        )
+        .await;
+    } else {
+        publish_state_changed_event(
+            state_events,
+            pane_id,
+            agent,
+            update.state,
+            update.visible_blocker,
+            update.visible_working,
+            update.process_exited,
+            observed_at,
+        )
+        .await;
+    }
+}
+
+fn read_reported_agent_detection_hint(hint: &AtomicU16) -> Option<Agent> {
+    hint.load(Ordering::Acquire)
+        .checked_sub(1)
+        .and_then(|index| Agent::ALL.get(usize::from(index)).copied())
 }
 
 const AGENT_MISS_CONFIRMATION_ATTEMPTS: u8 = 6;
@@ -796,6 +844,7 @@ fn spawn_basic_detection_task(
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     self_reported_agent_active: Arc<AtomicBool>,
+    reported_agent_detection_hint: Arc<AtomicU16>,
     state_events: mpsc::Sender<AppEvent>,
 ) -> (
     tokio::task::AbortHandle,
@@ -828,6 +877,7 @@ fn spawn_basic_detection_task(
         let mut pending_idle = PendingIdleConfirmation::default();
         let mut last_codex_prompt_ready = false;
         let mut last_self_reported_shell_check = None;
+        let mut reported_screen_agent = None;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -838,6 +888,18 @@ fn spawn_basic_detection_task(
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = detect_reset.notified() => {
+                    if reported_screen_agent.take().is_some() {
+                        publish_reported_session_screen_state_event(
+                            &state_events,
+                            pane_id,
+                            None,
+                            AgentState::Unknown,
+                            false,
+                            false,
+                            std::time::Instant::now(),
+                        )
+                        .await;
+                    }
                     publish_codex_prompt_observation(
                         &state_events, pane_id, Some(Agent::Codex), "", None, false,
                         &mut last_codex_prompt_ready,
@@ -957,6 +1019,9 @@ fn spawn_basic_detection_task(
                         || foreground_action
                             == ForegroundShellAgentAction::ReportReplacementProcess;
                     if agent_changed {
+                        if agent.is_some() {
+                            reported_screen_agent = None;
+                        }
                         pending_idle.clear();
                         last_codex_prompt_ready = false;
                         last_screen_scan_detection_content_seq = None;
@@ -990,6 +1055,18 @@ fn spawn_basic_detection_task(
                 && !foreground_shell_exit_reported;
 
             if lifecycle_authority_active && !process_exited {
+                if reported_screen_agent.take().is_some() {
+                    publish_reported_session_screen_state_event(
+                        &state_events,
+                        pane_id,
+                        None,
+                        AgentState::Unknown,
+                        false,
+                        false,
+                        now,
+                    )
+                    .await;
+                }
                 pending_idle.clear();
                 continue;
             }
@@ -1010,14 +1087,19 @@ fn spawn_basic_detection_task(
                 }
             }
 
-            let current_detection_content_seq = if agent.is_some() {
+            let reported_agent_hint =
+                read_reported_agent_detection_hint(&reported_agent_detection_hint);
+            let screen_agent = agent.or(reported_agent_hint);
+            let reported_session_fallback = agent.is_none() && reported_agent_hint.is_some();
+            let current_detection_content_seq = if screen_agent.is_some() {
                 Some(detection_content_seq.load(Ordering::Relaxed))
             } else {
                 None
             };
             match decide_detection_screen_read(DetectionScreenReadInput {
                 state,
-                agent,
+                agent: screen_agent,
+                allow_unchanged_unknown_skip: reported_session_fallback,
                 pending_idle_active: pending_idle.active(),
                 agent_changed,
                 process_exited,
@@ -1034,17 +1116,28 @@ fn spawn_basic_detection_task(
             last_detection_text.clone_from(&content);
             let osc_title = terminal.agent_osc_title();
             let osc_progress = terminal.agent_osc_progress();
-            let screen_detection = detection_update_for_publish_with_osc(
-                agent,
-                &content,
-                &osc_title,
-                &osc_progress,
-                process_exited,
-            );
+            let screen_detection = if reported_session_fallback {
+                screen_agent.and_then(|agent| {
+                    detection_update_for_reported_agent_with_osc(
+                        agent,
+                        &content,
+                        &osc_title,
+                        &osc_progress,
+                    )
+                })
+            } else {
+                detection_update_for_publish_with_osc(
+                    screen_agent,
+                    &content,
+                    &osc_title,
+                    &osc_progress,
+                    process_exited,
+                )
+            };
             publish_codex_prompt_observation(
                 &state_events,
                 pane_id,
-                agent,
+                screen_agent,
                 &content,
                 screen_detection.as_ref(),
                 process_exited,
@@ -1052,9 +1145,29 @@ fn spawn_basic_detection_task(
             )
             .await;
             let Some(screen_detection) = screen_detection else {
+                if reported_session_fallback && reported_screen_agent.take().is_some() {
+                    publish_reported_session_screen_state_event(
+                        &state_events,
+                        pane_id,
+                        None,
+                        AgentState::Unknown,
+                        false,
+                        false,
+                        now,
+                    )
+                    .await;
+                    state = AgentState::Unknown;
+                    last_visible_idle = false;
+                    last_visible_blocker = false;
+                    last_visible_working = false;
+                    last_visible_signal_refresh = None;
+                }
                 pending_idle.clear();
                 continue;
             };
+            if reported_session_fallback {
+                reported_screen_agent = screen_agent;
+            }
             sync_content_change_acquisition(
                 agent_presence.current_agent(),
                 suppressed_agent,
@@ -1089,13 +1202,14 @@ fn spawn_basic_detection_task(
                     apply_agent_detection_publish_update(
                         state_events.clone(),
                         pane_id,
-                        agent,
+                        screen_agent,
                         AgentDetectionPublishUpdate {
                             state: new_state,
                             visible_idle,
                             visible_blocker,
                             visible_working,
                             process_exited: publish_process_exited,
+                            reported_session_fallback,
                         },
                         now,
                         &mut state,
@@ -1369,6 +1483,7 @@ pub struct PaneRuntime {
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     self_reported_agent_active: Arc<AtomicBool>,
+    reported_agent_detection_hint: Arc<AtomicU16>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
@@ -2503,6 +2618,7 @@ impl PaneRuntime {
 
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
+        let reported_agent_detection_hint = Arc::new(AtomicU16::new(0));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
@@ -2510,6 +2626,7 @@ impl PaneRuntime {
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
             self_reported_agent_active.clone(),
+            reported_agent_detection_hint.clone(),
             events,
         );
 
@@ -2529,6 +2646,7 @@ impl PaneRuntime {
             detection_content_seq,
             full_lifecycle_authority_active,
             self_reported_agent_active,
+            reported_agent_detection_hint,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
@@ -2589,6 +2707,7 @@ impl PaneRuntime {
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
+        let reported_agent_detection_hint = Arc::new(AtomicU16::new(0));
         {
             let child_pid = child_pid.clone();
             let child_wait_completed = child_wait_completed.clone();
@@ -2713,6 +2832,7 @@ impl PaneRuntime {
             let detection_content_seq = detection_content_seq.clone();
             let full_lifecycle_authority_active_for_task = full_lifecycle_authority_active.clone();
             let self_reported_agent_active_for_task = self_reported_agent_active.clone();
+            let reported_agent_detection_hint_for_task = reported_agent_detection_hint.clone();
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detect_reset_notify = Arc::new(Notify::new());
@@ -2745,6 +2865,7 @@ impl PaneRuntime {
                 let mut pending_idle = PendingIdleConfirmation::default();
                 let mut last_codex_prompt_ready = false;
                 let mut last_self_reported_shell_check = None;
+                let mut reported_screen_agent = None;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2765,6 +2886,18 @@ impl PaneRuntime {
                     tokio::select! {
                         _ = tokio::time::sleep(tick) => {}
                         _ = detect_reset.notified() => {
+                            if reported_screen_agent.take().is_some() {
+                                publish_reported_session_screen_state_event(
+                                    &state_events,
+                                    pane_id,
+                                    None,
+                                    AgentState::Unknown,
+                                    false,
+                                    false,
+                                    Instant::now(),
+                                )
+                                .await;
+                            }
                             publish_codex_prompt_observation(
                                 &state_events, pane_id, Some(Agent::Codex), "", None, false,
                                 &mut last_codex_prompt_ready,
@@ -2920,6 +3053,9 @@ impl PaneRuntime {
                                     || foreground_action
                                         == ForegroundShellAgentAction::ReportReplacementProcess
                                 {
+                                    if agent.is_some() {
+                                        reported_screen_agent = None;
+                                    }
                                     pending_idle.clear();
                                     last_codex_prompt_ready = false;
                                     last_screen_scan_detection_content_seq = None;
@@ -2987,6 +3123,18 @@ impl PaneRuntime {
                         && !foreground_shell_exit_reported;
 
                     if lifecycle_authority_active && !process_exited {
+                        if reported_screen_agent.take().is_some() {
+                            publish_reported_session_screen_state_event(
+                                &state_events,
+                                pane_id,
+                                None,
+                                AgentState::Unknown,
+                                false,
+                                false,
+                                now,
+                            )
+                            .await;
+                        }
                         pending_idle.clear();
                         continue;
                     }
@@ -3007,14 +3155,20 @@ impl PaneRuntime {
                         }
                     }
 
-                    let current_detection_content_seq = if agent.is_some() {
+                    let reported_agent_hint =
+                        read_reported_agent_detection_hint(&reported_agent_detection_hint_for_task);
+                    let screen_agent = agent.or(reported_agent_hint);
+                    let reported_session_fallback =
+                        agent.is_none() && reported_agent_hint.is_some();
+                    let current_detection_content_seq = if screen_agent.is_some() {
                         Some(detection_content_seq.load(Ordering::Relaxed))
                     } else {
                         None
                     };
                     match decide_detection_screen_read(DetectionScreenReadInput {
                         state,
-                        agent,
+                        agent: screen_agent,
+                        allow_unchanged_unknown_skip: reported_session_fallback,
                         pending_idle_active: pending_idle.active(),
                         agent_changed,
                         process_exited,
@@ -3031,17 +3185,28 @@ impl PaneRuntime {
                     last_detection_text.clone_from(&content);
                     let osc_title = terminal.agent_osc_title();
                     let osc_progress = terminal.agent_osc_progress();
-                    let screen_detection = detection_update_for_publish_with_osc(
-                        agent,
-                        &content,
-                        &osc_title,
-                        &osc_progress,
-                        process_exited,
-                    );
+                    let screen_detection = if reported_session_fallback {
+                        screen_agent.and_then(|agent| {
+                            detection_update_for_reported_agent_with_osc(
+                                agent,
+                                &content,
+                                &osc_title,
+                                &osc_progress,
+                            )
+                        })
+                    } else {
+                        detection_update_for_publish_with_osc(
+                            screen_agent,
+                            &content,
+                            &osc_title,
+                            &osc_progress,
+                            process_exited,
+                        )
+                    };
                     publish_codex_prompt_observation(
                         &state_events,
                         pane_id,
-                        agent,
+                        screen_agent,
                         &content,
                         screen_detection.as_ref(),
                         process_exited,
@@ -3049,9 +3214,29 @@ impl PaneRuntime {
                     )
                     .await;
                     let Some(screen_detection) = screen_detection else {
+                        if reported_session_fallback && reported_screen_agent.take().is_some() {
+                            publish_reported_session_screen_state_event(
+                                &state_events,
+                                pane_id,
+                                None,
+                                AgentState::Unknown,
+                                false,
+                                false,
+                                now,
+                            )
+                            .await;
+                            state = AgentState::Unknown;
+                            last_visible_idle = false;
+                            last_visible_blocker = false;
+                            last_visible_working = false;
+                            last_visible_signal_refresh = None;
+                        }
                         pending_idle.clear();
                         continue;
                     };
+                    if reported_session_fallback {
+                        reported_screen_agent = screen_agent;
+                    }
                     sync_content_change_acquisition(
                         agent_presence.current_agent(),
                         suppressed_agent,
@@ -3086,13 +3271,14 @@ impl PaneRuntime {
                             apply_agent_detection_publish_update(
                                 state_events.clone(),
                                 pane_id,
-                                agent,
+                                screen_agent,
                                 AgentDetectionPublishUpdate {
                                     state: new_state,
                                     visible_idle,
                                     visible_blocker,
                                     visible_working,
                                     process_exited: publish_process_exited,
+                                    reported_session_fallback,
                                 },
                                 now,
                                 &mut state,
@@ -3132,6 +3318,7 @@ impl PaneRuntime {
             detection_content_seq,
             full_lifecycle_authority_active,
             self_reported_agent_active,
+            reported_agent_detection_hint,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
@@ -3162,6 +3349,32 @@ impl PaneRuntime {
     pub fn set_self_reported_agent_active(&self, active: bool) {
         self.self_reported_agent_active
             .store(active, Ordering::Release);
+    }
+
+    pub fn set_reported_agent_detection_hint(&self, agent: Option<Agent>) {
+        let encoded_agent = match agent {
+            Some(agent) => Agent::ALL
+                .iter()
+                .position(|candidate| *candidate == agent)
+                .and_then(|index| u16::try_from(index).ok())
+                .and_then(|index| index.checked_add(1))
+                .unwrap_or_else(|| {
+                    error!(
+                        pane = self.pane_id.raw(),
+                        ?agent,
+                        "reported agent is missing from the detection registry"
+                    );
+                    0
+                }),
+            None => 0,
+        };
+        if self
+            .reported_agent_detection_hint
+            .swap(encoded_agent, Ordering::AcqRel)
+            != encoded_agent
+        {
+            self.detect_reset_notify.notify_one();
+        }
     }
 
     pub fn set_full_lifecycle_authority_active(&self, active: bool) {
@@ -3856,6 +4069,7 @@ impl PaneRuntime {
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 self_reported_agent_active: Arc::new(AtomicBool::new(false)),
+                reported_agent_detection_hint: Arc::new(AtomicU16::new(0)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
@@ -5008,6 +5222,7 @@ mod tests {
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let runtime = PaneRuntime {
             self_reported_agent_active: Arc::new(AtomicBool::new(false)),
+            reported_agent_detection_hint: Arc::new(AtomicU16::new(0)),
             cwd_process_exited: Arc::new(AtomicBool::new(false)),
             persistence_cwd: Mutex::new(None),
             pane_id,
@@ -5048,6 +5263,7 @@ mod tests {
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let runtime = PaneRuntime {
             self_reported_agent_active: Arc::new(AtomicBool::new(false)),
+            reported_agent_detection_hint: Arc::new(AtomicU16::new(0)),
             cwd_process_exited: Arc::new(AtomicBool::new(false)),
             persistence_cwd: Mutex::new(None),
             pane_id,
@@ -5826,6 +6042,39 @@ mod tests {
         )
         .await
         .expect("re-entering active authority should notify detection reset");
+    }
+
+    #[tokio::test]
+    async fn reported_agent_hint_changes_reset_screen_detection() {
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"");
+        let reset_notify = runtime.agent_detection_reset_notify_for_test();
+
+        runtime.set_reported_agent_detection_hint(Some(Agent::Claude));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            reset_notify.notified(),
+        )
+        .await
+        .expect("a reported agent should trigger a fresh screen scan");
+
+        runtime.set_reported_agent_detection_hint(Some(Agent::Claude));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                reset_notify.notified()
+            )
+            .await
+            .is_err(),
+            "unchanged hint should not trigger repeated resets"
+        );
+
+        runtime.set_reported_agent_detection_hint(None);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            reset_notify.notified(),
+        )
+        .await
+        .expect("removing a reported agent should clear screen attribution");
     }
 
     #[cfg(unix)]

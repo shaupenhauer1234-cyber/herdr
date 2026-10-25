@@ -238,6 +238,10 @@ impl TerminalRuntime {
         self.0.reset_agent_detection();
     }
 
+    pub fn set_reported_agent_detection_hint(&self, agent: Option<crate::detect::Agent>) {
+        self.0.set_reported_agent_detection_hint(agent);
+    }
+
     #[cfg(test)]
     pub(crate) fn agent_detection_reset_notify_for_test(
         &self,

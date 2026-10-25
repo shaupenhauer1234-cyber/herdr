@@ -463,6 +463,9 @@ impl App {
                         terminal.full_lifecycle_hook_authority_active(),
                     );
                     runtime.set_self_reported_agent_active(terminal.self_reported_agent_active());
+                    runtime.set_reported_agent_detection_hint(
+                        terminal.reported_agent_screen_detection_hint(),
+                    );
                 }
             }
         }

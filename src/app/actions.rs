@@ -1470,6 +1470,25 @@ impl AppState {
                 })
                 .into_iter()
                 .collect(),
+            AppEvent::ReportedSessionScreenState {
+                pane_id,
+                agent,
+                state,
+                visible_blocker,
+                visible_working,
+                observed_at,
+            } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    terminal.set_reported_agent_screen_state_at(
+                        agent,
+                        state,
+                        visible_blocker,
+                        visible_working,
+                        observed_at,
+                    )
+                })
+                .into_iter()
+                .collect(),
             AppEvent::HookStateReported {
                 pane_id,
                 source,
@@ -3595,6 +3614,39 @@ mod tests {
             .attached_terminal_id
             .clone();
         (pane_id, terminal_id)
+    }
+
+    #[test]
+    fn reported_session_screen_state_activates_fallback_agent_identity() {
+        let mut state = app_with_workspaces(&["one"]);
+        let (pane_id, terminal_id) = first_pane_terminal(&state);
+        state.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            seq: Some(1),
+            session_ref: Some(
+                crate::agent_resume::AgentSessionRef::id("claude-session")
+                    .expect("session id should be valid"),
+            ),
+            session_start_source: None,
+        });
+
+        let updates = state.handle_app_event(AppEvent::ReportedSessionScreenState {
+            pane_id,
+            agent: Some(Agent::Claude),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            state.terminals[&terminal_id].effective_agent_label(),
+            Some("claude")
+        );
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Working);
     }
 
     #[test]

@@ -372,6 +372,18 @@ pub fn detect_with_osc(agent: Agent, input: DetectionInput<'_>) -> AgentDetectio
     evaluate_loaded_manifest(agent, input, loaded, false).into_detection()
 }
 
+pub fn detect_with_osc_if_rule_matches(
+    agent: Agent,
+    input: DetectionInput<'_>,
+) -> Option<AgentDetection> {
+    let loaded = load_manifest(agent)?;
+    let explain = evaluate_loaded_manifest(agent, input, loaded, false);
+    (explain.matched_rule.is_some()
+        && !explain.skip_state_update
+        && explain.state != AgentState::Unknown)
+        .then(|| explain.into_detection())
+}
+
 pub fn explain(agent: Agent, screen_content: &str) -> DetectionExplain {
     explain_with_input(
         agent,
